@@ -15,13 +15,7 @@ workflows:
           filters:
             branches:
               only: master
-      - deploy-AWS:
-          requires:
-            - deploy-GCP
-          filters:
-            branches:
-              only: master
-
+   
 
 
 
@@ -188,113 +182,6 @@ jobs:
 
 
 
-
-  deploy-AWS:
-    docker:
-      - image: circleci/python:2
-    working_directory: ~/repo
-    steps:
-      - attach_workspace: 
-          at: /tmp
-      - run: 
-          name: Install kops 
-          command: |
-            wget -O kops https://github.com/kubernetes/kops/releases/download/$(curl -s https://api.github.com/repos/kubernetes/kops/releases/latest | grep tag_name | cut -d '"' -f 4)/kops-linux-amd64
-            chmod +x ./kops
-            sudo mv ./kops /usr/local/bin/kops
-            echo "export KOPS_CLUSTER_NAME=${K8S_DOMAIN_AWS}" >> $BASH_ENV
-            echo "export KOPS_STATE_STORE=s3://${S3_BUCKET_NAME}" >> $BASH_ENV
-      - run: 
-          name: Install kubectl
-          command: |
-            wget -O kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
-            chmod +x ./kubectl
-            sudo mv ./kubectl /usr/local/bin/kubectl
-      - run: 
-          name: Install aws cli
-          command: |
-            sudo pip install awscli
-            echo "export AWS_REGION=us-east-2" >> $BASH_ENV
-      - run: 
-          name: Create CLuster
-          command: |
-            if kops get cluster --name ${KOPS_CLUSTER_NAME} ; then
-              echo "Cluster exists, loading configuration into kubectl"
-              kops export kubecfg --name ${KOPS_CLUSTER_NAME}
-            else
-              echo "Creating cluster" 
-              echo "${KOPS_PUBLIC_KEY}" > ~/.ssh/kops_id.pub
-              kops create cluster \
-                  --node-count=2 \
-                  --node-size=t2.medium \
-                  --zones=us-east-2a \
-                  --name=${KOPS_CLUSTER_NAME}
-
-              kops create secret --name ${KOPS_CLUSTER_NAME} sshpublickey admin -i ~/.ssh/kops_id.pub
-              kops update cluster --name ${KOPS_CLUSTER_NAME} --yes
-            fi
-            attempts=0
-            until kops validate cluster ; do
-              # wait up to 10 minutes for helthy cluster
-              if [ $attempts -lt 10 ];then
-                echo "Cluster not ready"
-                sleep 30
-                let attempts=attempts+1
-              else
-                echo "Attempts failed"
-                #exit 1
-              fi
-            done
-
-
-            #push image for first run, or update existing.
-            source /tmp/docker_image
-            echo "Deploying IMage: ${DOCKER_IMAGE}"
-            if kubectl describe deployment/circleci-k8s-demo ;then
-              echo "Updating image on existing deployment" 
-              kubectl set image deployment/circleci-k8s-demo circleci-k8s-demo=${DOCKER_IMAGE}
-            else
-              echo "running first deployment"
-              kubectl run circleci-k8s-demo --image=${DOCKER_IMAGE} --port 8080
-            fi
-
-            # block until deployment is running
-            kubectl rollout status deployment/circleci-k8s-demo
-
-            if kubectl get service circleci-k8s-demo ;then
-              echo "Service is exposed"
-            else
-              echo "Exposing deployment on Load Balancer"
-              kubectl expose deployment circleci-k8s-demo --type=LoadBalancer --port 80 --target-port 8080
-            fi
-      - run: 
-          name: Updayte CloudFlare Load Balancer with AWS ELB
-          command: |
-            # unlike our GCP example that used CloudFlare DNS, our AWS example uses AWS DNS/ELBs 
-            # So we'll grab the ELB FQDN, and update our CloudFlare Load Balancer pool.
-
-            # It may take AWS a minute to instantiate and route the ELB
-            ELB_FQDN=""
-            while [ -z $ELB_FQDN ]; do
-              echo "Waiting for end point..."
-              ELB_FQDN=$(kubectl get service circleci-k8s-demo -o go-template='{{(index .status.loadBalancer.ingress 0).hostname}}')
-              [ -z "$ELB_FQDN" ] && sleep 10
-            done
-            echo "Setting CloudFLare origin pool to ELB: $ELB_FQDN"
-
-            # Once ready, add to our origin pool
-            curl -X PUT "https://api.cloudflare.com/client/v4/user/load_balancers/pools/891e99bce3e5955ced3bfab5714ad620" \
-                -H "X-Auth-Email: ${CLOUDFLARE_EMAIL}" \
-                -H "X-Auth-Key: ${CLOUDFLARE_API_KEY}" \
-                -H "Content-Type: application/json" \
-                --data '{"name":"AWS","origins":[{"name":"cluster-1","address":"'${ELB_FQDN}'","enabled":true,"weight":1}]}'
-      
-
-
-
-
-
-
   cloudflare:
     docker:
       - image: circleci/python:2
@@ -305,7 +192,6 @@ jobs:
           command: |
             # create or verify LB exists on cname
             # Create or update origin pool for GCP using ${K8S_DOMAIN_GCP}
-            # Create or update origin pool for AWS using ${K8S_DOMAIN_AWS}
             echo "Waiting for premium support."
       - run:    
           name: Update CloudFlare Proxy to Force SSL
